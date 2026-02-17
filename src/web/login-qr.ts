@@ -126,6 +126,19 @@ export async function startWebLoginWithQr(
     };
   }
 
+  if (opts.force && hasWeb) {
+    try {
+      await logoutWeb({
+        authDir: account.authDir,
+        isLegacyAuthDir: account.isLegacyAuthDir,
+        runtime,
+      });
+      runtime.log(info("Cleared existing WhatsApp web session before relink."));
+    } catch (err) {
+      runtime.log(danger(`Failed to clear existing WhatsApp session before relink: ${formatError(err)}`));
+    }
+  }
+
   const existing = activeLogins.get(account.accountId);
   if (existing && isLoginFresh(existing) && existing.qrDataUrl) {
     return {
@@ -199,6 +212,12 @@ export async function startWebLoginWithQr(
     qr = await qrPromise;
   } catch (err) {
     clearTimeout(qrTimer);
+    if (login.connected) {
+      await resetActiveLogin(account.accountId);
+      return {
+        message: "WhatsApp linked without showing a QR (session was already authorized).",
+      };
+    }
     await resetActiveLogin(account.accountId);
     return {
       message: `Failed to get QR: ${String(err)}`,

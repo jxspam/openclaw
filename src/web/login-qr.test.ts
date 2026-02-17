@@ -36,7 +36,7 @@ vi.mock("./qr-image.js", () => ({
 }));
 
 const { startWebLoginWithQr, waitForWebLogin } = await import("./login-qr.js");
-const { createWaSocket, waitForWaConnection, logoutWeb } = await import("./session.js");
+const { createWaSocket, waitForWaConnection, logoutWeb, webAuthExists } = await import("./session.js");
 
 describe("login-qr", () => {
   beforeEach(() => {
@@ -56,5 +56,26 @@ describe("login-qr", () => {
     expect(result.connected).toBe(true);
     expect(createWaSocket).toHaveBeenCalledTimes(2);
     expect(logoutWeb).not.toHaveBeenCalled();
+  });
+
+  it("force relink clears existing auth before starting login", async () => {
+    webAuthExists.mockResolvedValueOnce(true);
+    waitForWaConnection.mockResolvedValueOnce(undefined);
+
+    const start = await startWebLoginWithQr({ force: true, timeoutMs: 5000 });
+    await waitForWebLogin({ timeoutMs: 5000 });
+
+    expect(start.qrDataUrl).toBe("data:image/png;base64,base64");
+    expect(logoutWeb).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns a friendly message when session links without emitting a QR", async () => {
+    createWaSocket.mockImplementationOnce(async () => ({ ws: { close: vi.fn() } }));
+    waitForWaConnection.mockResolvedValueOnce(undefined);
+
+    const start = await startWebLoginWithQr({ timeoutMs: 20 });
+
+    expect(start.qrDataUrl).toBeUndefined();
+    expect(start.message).toContain("linked without showing a QR");
   });
 });
