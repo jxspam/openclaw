@@ -50,6 +50,19 @@ extension ChannelsStore {
         defer { self.whatsappBusy = false }
         var shouldAutoWait = false
         do {
+            if force {
+                // UX hardening: when relinking from UI, explicitly clear channel auth first
+                // (equivalent to `openclaw channels logout --channel whatsapp`) before
+                // requesting a fresh QR, to avoid stale-account/session edge cases.
+                let logoutParams: [String: AnyCodable] = [
+                    "channel": AnyCodable("whatsapp"),
+                ]
+                _ = try? await GatewayConnection.shared.requestDecoded(
+                    method: .channelsLogout,
+                    params: logoutParams,
+                    timeoutMs: 15000) as ChannelLogoutResult
+            }
+
             let params: [String: AnyCodable] = [
                 "force": AnyCodable(force),
                 "timeoutMs": AnyCodable(30000),
