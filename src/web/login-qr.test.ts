@@ -69,11 +69,23 @@ describe("login-qr", () => {
     expect(logoutWeb).toHaveBeenCalledTimes(1);
   });
 
+  it("force relink does not reuse an already active QR", async () => {
+    waitForWaConnection.mockResolvedValue(undefined);
+
+    const first = await startWebLoginWithQr({ timeoutMs: 5000 });
+    const second = await startWebLoginWithQr({ force: true, timeoutMs: 5000 });
+
+    expect(first.qrDataUrl).toBe("data:image/png;base64,base64");
+    expect(second.qrDataUrl).toBe("data:image/png;base64,base64");
+    expect(second.message).toBe("Scan this QR in WhatsApp → Linked Devices.");
+    expect(createWaSocket).toHaveBeenCalledTimes(2);
+  });
+
   it("returns a friendly message when session links without emitting a QR", async () => {
     createWaSocket.mockImplementationOnce(async () => ({ ws: { close: vi.fn() } }));
     waitForWaConnection.mockResolvedValueOnce(undefined);
 
-    const start = await startWebLoginWithQr({ timeoutMs: 20 });
+    const start = await startWebLoginWithQr({ force: true, timeoutMs: 20 });
 
     expect(start.qrDataUrl).toBeUndefined();
     expect(start.message).toContain("linked without showing a QR");
