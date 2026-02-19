@@ -233,6 +233,8 @@ final class ChannelsStore {
     var whatsappLoginQrDataUrl: String?
     var whatsappLoginConnected: Bool?
     var whatsappBusy = false
+    var whatsappLoginInProgress = false
+    var whatsappLoginWaitTask: Task<Void, Never>?
     var telegramBusy = false
 
     var configStatus: String?

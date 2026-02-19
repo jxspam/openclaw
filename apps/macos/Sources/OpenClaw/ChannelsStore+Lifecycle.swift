@@ -2,6 +2,9 @@ import OpenClawProtocol
 import Foundation
 
 extension ChannelsStore {
+    private func resolvedWhatsAppAccountId() -> String {
+        self.snapshot?.channelDefaultAccountId["whatsapp"] ?? "default"
+    }
     func start() {
         guard !self.isPreview else { return }
         guard self.pollTask == nil else { return }
@@ -46,16 +49,28 @@ extension ChannelsStore {
 
     func startWhatsAppLogin(force: Bool, autoWait: Bool = true) async {
         guard !self.whatsappBusy else { return }
+        if force && self.whatsappLoginInProgress {
+            self.whatsappLoginMessage = "Relink already in progress. Please scan the current QR or wait for timeout."
+            return
+        }
+
         self.whatsappBusy = true
         defer { self.whatsappBusy = false }
+
+        let accountId = self.resolvedWhatsAppAccountId()
         var shouldAutoWait = false
         do {
             if force {
                 // UX hardening: when relinking from UI, explicitly clear channel auth first
-                // (equivalent to `openclaw channels logout --channel whatsapp`) before
-                // requesting a fresh QR, to avoid stale-account/session edge cases.
+                // (equivalent to `openclaw channels logout --channel whatsapp --account <id>`)
+                // before requesting a fresh QR.
+                self.whatsappLoginWaitTask?.cancel()
+                self.whatsappLoginWaitTask = nil
+                self.whatsappLoginInProgress = false
+
                 let logoutParams: [String: AnyCodable] = [
                     "channel": AnyCodable("whatsapp"),
+                    "account": AnyCodable(accountId),
                 ]
                 _ = try? await GatewayConnection.shared.requestDecoded(
                     method: .channelsLogout,
@@ -66,6 +81,7 @@ extension ChannelsStore {
             let params: [String: AnyCodable] = [
                 "force": AnyCodable(force),
                 "timeoutMs": AnyCodable(30000),
+                "accountId": AnyCodable(accountId),
             ]
             let result: WhatsAppLoginStartResult = try await GatewayConnection.shared.requestDecoded(
                 method: .webLoginStart,
@@ -75,24 +91,32 @@ extension ChannelsStore {
             self.whatsappLoginQrDataUrl = result.qrDataUrl
             self.whatsappLoginConnected = nil
             shouldAutoWait = autoWait && result.qrDataUrl != nil
+            self.whatsappLoginInProgress = shouldAutoWait
         } catch {
             self.whatsappLoginMessage = error.localizedDescription
             self.whatsappLoginQrDataUrl = nil
             self.whatsappLoginConnected = nil
+            self.whatsappLoginInProgress = false
         }
         await self.refresh(probe: true)
         if shouldAutoWait {
-            Task { await self.waitWhatsAppLogin() }
+            self.whatsappLoginWaitTask?.cancel()
+            self.whatsappLoginWaitTask = Task { await self.waitWhatsAppLogin(accountId: accountId) }
         }
     }
 
-    func waitWhatsAppLogin(timeoutMs: Int = 120_000) async {
+    func waitWhatsAppLogin(timeoutMs: Int = 120_000, accountId: String? = nil) async {
         guard !self.whatsappBusy else { return }
         self.whatsappBusy = true
-        defer { self.whatsappBusy = false }
+        defer {
+            self.whatsappBusy = false
+            self.whatsappLoginInProgress = false
+            self.whatsappLoginWaitTask = nil
+        }
         do {
             let params: [String: AnyCodable] = [
                 "timeoutMs": AnyCodable(timeoutMs),
+                "accountId": AnyCodable(accountId ?? self.resolvedWhatsAppAccountId()),
             ]
             let result: WhatsAppLoginWaitResult = try await GatewayConnection.shared.requestDecoded(
                 method: .webLoginWait,
@@ -114,8 +138,13 @@ extension ChannelsStore {
         self.whatsappBusy = true
         defer { self.whatsappBusy = false }
         do {
+            self.whatsappLoginWaitTask?.cancel()
+            self.whatsappLoginWaitTask = nil
+            self.whatsappLoginInProgress = false
+
             let params: [String: AnyCodable] = [
                 "channel": AnyCodable("whatsapp"),
+                "account": AnyCodable(self.resolvedWhatsAppAccountId()),
             ]
             let result: ChannelLogoutResult = try await GatewayConnection.shared.requestDecoded(
                 method: .channelsLogout,
