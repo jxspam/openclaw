@@ -1,6 +1,6 @@
-import type { AgentCommandOpts, AgentRunContext } from "./types.js";
 import { normalizeAccountId } from "../../utils/account-id.js";
 import { resolveMessageChannel } from "../../utils/message-channel.js";
+import type { AgentCommandOpts, AgentRunContext } from "./types.js";
 
 export function resolveAgentRunContext(opts: AgentCommandOpts): AgentRunContext {
   const merged: AgentRunContext = opts.runContext ? { ...opts.runContext } : {};
@@ -42,8 +42,8 @@ export function resolveAgentRunContext(opts: AgentCommandOpts): AgentRunContext 
     merged.currentThreadTs = String(opts.threadId);
   }
 
-  // Populate currentChannelId from the outbound target so that
-  // resolveTelegramAutoThreadId can match the originating chat.
+  // Populate currentChannelId from the outbound target so channel threading
+  // adapters can detect same-conversation auto-threading.
   if (!merged.currentChannelId && opts.to) {
     const trimmedTo = opts.to.trim();
     if (trimmedTo) {

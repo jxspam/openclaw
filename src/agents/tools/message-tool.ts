@@ -1,27 +1,33 @@
 import { Type } from "@sinclair/typebox";
-import type { OpenClawConfig } from "../../config/config.js";
-import type { AnyAgentTool } from "./common.js";
 import { BLUEBUBBLES_GROUP_ACTIONS } from "../../channels/plugins/bluebubbles-actions.js";
+import { listChannelPlugins } from "../../channels/plugins/index.js";
 import {
+  channelSupportsMessageCapability,
+  channelSupportsMessageCapabilityForChannel,
   listChannelMessageActions,
-  supportsChannelMessageButtons,
-  supportsChannelMessageCards,
 } from "../../channels/plugins/message-actions.js";
+import type { ChannelMessageCapability } from "../../channels/plugins/message-capabilities.js";
 import {
   CHANNEL_MESSAGE_ACTION_NAMES,
   type ChannelMessageActionName,
 } from "../../channels/plugins/types.js";
+import { resolveCommandSecretRefsViaGateway } from "../../cli/command-secret-gateway.js";
+import { getChannelsCommandSecretTargetIds } from "../../cli/command-secret-targets.js";
+import type { OpenClawConfig } from "../../config/config.js";
 import { loadConfig } from "../../config/config.js";
 import { GATEWAY_CLIENT_IDS, GATEWAY_CLIENT_MODES } from "../../gateway/protocol/client-info.js";
 import { getToolResult, runMessageAction } from "../../infra/outbound/message-action-runner.js";
 import { normalizeTargetForProvider } from "../../infra/outbound/target-normalization.js";
+import { POLL_CREATION_PARAM_DEFS, POLL_CREATION_PARAM_NAMES } from "../../poll-params.js";
 import { normalizeAccountId } from "../../routing/session-key.js";
 import { stripReasoningTagsFromText } from "../../shared/text/reasoning-tags.js";
 import { normalizeMessageChannel } from "../../utils/message-channel.js";
 import { resolveSessionAgentId } from "../agent-scope.js";
 import { listChannelSupportedActions } from "../channel-tools.js";
 import { channelTargetSchema, channelTargetsSchema, stringEnum } from "../schema/typebox.js";
+import type { AnyAgentTool } from "./common.js";
 import { jsonResult, readNumberParam, readStringParam } from "./common.js";
+import { resolveGatewayOptions } from "./gateway.js";
 
 const AllMessageActions = CHANNEL_MESSAGE_ACTION_NAMES;
 const EXPLICIT_TARGET_ACTIONS = new Set<ChannelMessageActionName>([
@@ -46,7 +52,152 @@ function buildRoutingSchema() {
   };
 }
 
-function buildSendSchema(options: { includeButtons: boolean; includeCards: boolean }) {
+const discordComponentEmojiSchema = Type.Object({
+  name: Type.String(),
+  id: Type.Optional(Type.String()),
+  animated: Type.Optional(Type.Boolean()),
+});
+
+const discordComponentOptionSchema = Type.Object({
+  label: Type.String(),
+  value: Type.String(),
+  description: Type.Optional(Type.String()),
+  emoji: Type.Optional(discordComponentEmojiSchema),
+  default: Type.Optional(Type.Boolean()),
+});
+
+const discordComponentButtonSchema = Type.Object({
+  label: Type.String(),
+  style: Type.Optional(stringEnum(["primary", "secondary", "success", "danger", "link"])),
+  url: Type.Optional(Type.String()),
+  emoji: Type.Optional(discordComponentEmojiSchema),
+  disabled: Type.Optional(Type.Boolean()),
+  allowedUsers: Type.Optional(
+    Type.Array(
+      Type.String({
+        description: "Discord user ids or names allowed to interact with this button.",
+      }),
+    ),
+  ),
+});
+
+const discordComponentSelectSchema = Type.Object({
+  type: Type.Optional(stringEnum(["string", "user", "role", "mentionable", "channel"])),
+  placeholder: Type.Optional(Type.String()),
+  minValues: Type.Optional(Type.Number()),
+  maxValues: Type.Optional(Type.Number()),
+  options: Type.Optional(Type.Array(discordComponentOptionSchema)),
+});
+
+const discordComponentBlockSchema = Type.Object({
+  type: Type.String(),
+  text: Type.Optional(Type.String()),
+  texts: Type.Optional(Type.Array(Type.String())),
+  accessory: Type.Optional(
+    Type.Object({
+      type: Type.String(),
+      url: Type.Optional(Type.String()),
+      button: Type.Optional(discordComponentButtonSchema),
+    }),
+  ),
+  spacing: Type.Optional(stringEnum(["small", "large"])),
+  divider: Type.Optional(Type.Boolean()),
+  buttons: Type.Optional(Type.Array(discordComponentButtonSchema)),
+  select: Type.Optional(discordComponentSelectSchema),
+  items: Type.Optional(
+    Type.Array(
+      Type.Object({
+        url: Type.String(),
+        description: Type.Optional(Type.String()),
+        spoiler: Type.Optional(Type.Boolean()),
+      }),
+    ),
+  ),
+  file: Type.Optional(Type.String()),
+  spoiler: Type.Optional(Type.Boolean()),
+});
+
+const discordComponentModalFieldSchema = Type.Object({
+  type: Type.String(),
+  name: Type.Optional(Type.String()),
+  label: Type.String(),
+  description: Type.Optional(Type.String()),
+  placeholder: Type.Optional(Type.String()),
+  required: Type.Optional(Type.Boolean()),
+  options: Type.Optional(Type.Array(discordComponentOptionSchema)),
+  minValues: Type.Optional(Type.Number()),
+  maxValues: Type.Optional(Type.Number()),
+  minLength: Type.Optional(Type.Number()),
+  maxLength: Type.Optional(Type.Number()),
+  style: Type.Optional(stringEnum(["short", "paragraph"])),
+});
+
+const discordComponentModalSchema = Type.Object({
+  title: Type.String(),
+  triggerLabel: Type.Optional(Type.String()),
+  triggerStyle: Type.Optional(stringEnum(["primary", "secondary", "success", "danger", "link"])),
+  fields: Type.Array(discordComponentModalFieldSchema),
+});
+
+const discordComponentMessageSchema = Type.Object(
+  {
+    text: Type.Optional(Type.String()),
+    reusable: Type.Optional(
+      Type.Boolean({
+        description: "Allow components to be used multiple times until they expire.",
+      }),
+    ),
+    container: Type.Optional(
+      Type.Object({
+        accentColor: Type.Optional(Type.String()),
+        spoiler: Type.Optional(Type.Boolean()),
+      }),
+    ),
+    blocks: Type.Optional(Type.Array(discordComponentBlockSchema)),
+    modal: Type.Optional(discordComponentModalSchema),
+  },
+  {
+    description:
+      "Discord components v2 payload. Set reusable=true to keep buttons, selects, and forms active until expiry.",
+  },
+);
+
+const interactiveOptionSchema = Type.Object({
+  label: Type.String(),
+  value: Type.String(),
+});
+
+const interactiveButtonSchema = Type.Object({
+  label: Type.String(),
+  value: Type.String(),
+  style: Type.Optional(stringEnum(["primary", "secondary", "success", "danger"])),
+});
+
+const interactiveBlockSchema = Type.Object({
+  type: stringEnum(["text", "buttons", "select"]),
+  text: Type.Optional(Type.String()),
+  buttons: Type.Optional(Type.Array(interactiveButtonSchema)),
+  placeholder: Type.Optional(Type.String()),
+  options: Type.Optional(Type.Array(interactiveOptionSchema)),
+});
+
+const interactiveMessageSchema = Type.Object(
+  {
+    blocks: Type.Array(interactiveBlockSchema),
+  },
+  {
+    description:
+      "Shared interactive message payload for buttons and selects. Channels render this into their native components when supported.",
+  },
+);
+
+function buildSendSchema(options: {
+  includeInteractive: boolean;
+  includeButtons: boolean;
+  includeCards: boolean;
+  includeComponents: boolean;
+  includeBlocks: boolean;
+}) {
   const props: Record<string, unknown> = {
     message: Type.Optional(Type.String()),
     effectId: Type.Optional(
@@ -82,12 +233,19 @@ function buildSendSchema(options: { includeButtons: boolean; includeCards: boole
     ),
     bestEffort: Type.Optional(Type.Boolean()),
     gifPlayback: Type.Optional(Type.Boolean()),
+    forceDocument: Type.Optional(
+      Type.Boolean({
+        description: "Send image/GIF as document to avoid Telegram compression (Telegram only).",
+      }),
+    ),
+    interactive: Type.Optional(interactiveMessageSchema),
     buttons: Type.Optional(
       Type.Array(
         Type.Array(
           Type.Object({
             text: Type.String(),
             callback_data: Type.String(),
+            style: Type.Optional(stringEnum(["danger", "success", "primary"])),
           }),
         ),
         {
@@ -104,19 +262,52 @@ function buildSendSchema(options: { includeButtons: boolean; includeCards: boole
         },
       ),
     ),
+    components: Type.Optional(discordComponentMessageSchema),
+    blocks: Type.Optional(
+      Type.Array(
+        Type.Object(
+          {},
+          {
+            additionalProperties: true,
+            description: "Slack Block Kit payload blocks (Slack only).",
+          },
+        ),
+      ),
+    ),
   };
   if (!options.includeButtons) {
     delete props.buttons;
   }
+  if (!options.includeInteractive) {
+    delete props.interactive;
+  }
   if (!options.includeCards) {
     delete props.card;
+  }
+  if (!options.includeComponents) {
+    delete props.components;
+  }
+  if (!options.includeBlocks) {
+    delete props.blocks;
   }
   return props;
 }
 
 function buildReactionSchema() {
   return {
-    messageId: Type.Optional(Type.String()),
+    messageId: Type.Optional(
+      Type.String({
+        description:
+          "Target message id for reaction. If omitted, defaults to the current inbound message id when available.",
+      }),
+    ),
+    message_id: Type.Optional(
+      Type.String({
+        // Intentional duplicate alias for tool-schema discoverability in LLMs.
+        description:
+          "snake_case alias of messageId. If omitted, defaults to the current inbound message id when available.",
+      }),
+    ),
     emoji: Type.Optional(Type.String()),
     remove: Type.Optional(Type.Boolean()),
     targetAuthor: Type.Optional(Type.String()),
@@ -128,6 +319,8 @@ function buildReactionSchema() {
 function buildFetchSchema() {
   return {
     limit: Type.Optional(Type.Number()),
+    pageSize: Type.Optional(Type.Number()),
+    pageToken: Type.Optional(Type.String()),
     before: Type.Optional(Type.String()),
     after: Type.Optional(Type.String()),
     around: Type.Optional(Type.String()),
@@ -136,13 +329,58 @@ function buildFetchSchema() {
   };
 }
 
-function buildPollSchema() {
-  return {
-    pollQuestion: Type.Optional(Type.String()),
-    pollOption: Type.Optional(Type.Array(Type.String())),
-    pollDurationHours: Type.Optional(Type.Number()),
-    pollMulti: Type.Optional(Type.Boolean()),
+function buildPollSchema(options?: { includeTelegramExtras?: boolean }) {
+  const props: Record<string, unknown> = {
+    pollId: Type.Optional(Type.String()),
+    pollOptionId: Type.Optional(
+      Type.String({
+        description: "Poll answer id to vote for. Use when the channel exposes stable answer ids.",
+      }),
+    ),
+    pollOptionIds: Type.Optional(
+      Type.Array(
+        Type.String({
+          description:
+            "Poll answer ids to vote for in a multiselect poll. Use when the channel exposes stable answer ids.",
+        }),
+      ),
+    ),
+    pollOptionIndex: Type.Optional(
+      Type.Number({
+        description:
+          "1-based poll option number to vote for, matching the rendered numbered poll choices.",
+      }),
+    ),
+    pollOptionIndexes: Type.Optional(
+      Type.Array(
+        Type.Number({
+          description:
+            "1-based poll option numbers to vote for in a multiselect poll, matching the rendered numbered poll choices.",
+        }),
+      ),
+    ),
   };
+  for (const name of POLL_CREATION_PARAM_NAMES) {
+    const def = POLL_CREATION_PARAM_DEFS[name];
+    if (def.telegramOnly && !options?.includeTelegramExtras) {
+      continue;
+    }
+    switch (def.kind) {
+      case "string":
+        props[name] = Type.Optional(Type.String());
+        break;
+      case "stringArray":
+        props[name] = Type.Optional(Type.Array(Type.String()));
+        break;
+      case "number":
+        props[name] = Type.Optional(Type.Number());
+        break;
+      case "boolean":
+        props[name] = Type.Optional(Type.Boolean());
+        break;
+    }
+  }
+  return props;
 }
 
 function buildChannelTargetSchema() {
@@ -150,16 +388,27 @@ function buildChannelTargetSchema() {
     channelId: Type.Optional(
       Type.String({ description: "Channel id filter (search/thread list/event create)." }),
     ),
+    chatId: Type.Optional(
+      Type.String({ description: "Chat id for chat-scoped metadata actions." }),
+    ),
     channelIds: Type.Optional(
       Type.Array(Type.String({ description: "Channel id filter (repeatable)." })),
     ),
+    memberId: Type.Optional(Type.String()),
+    memberIdType: Type.Optional(Type.String()),
     guildId: Type.Optional(Type.String()),
     userId: Type.Optional(Type.String()),
+    openId: Type.Optional(Type.String()),
+    unionId: Type.Optional(Type.String()),
     authorId: Type.Optional(Type.String()),
     authorIds: Type.Optional(Type.Array(Type.String())),
     roleId: Type.Optional(Type.String()),
     roleIds: Type.Optional(Type.Array(Type.String())),
     participant: Type.Optional(Type.String()),
+    includeMembers: Type.Optional(Type.Boolean()),
+    members: Type.Optional(Type.Boolean()),
+    scope: Type.Optional(Type.String()),
+    kind: Type.Optional(Type.String()),
   };
 }
 
@@ -177,6 +426,7 @@ function buildThreadSchema() {
   return {
     threadName: Type.Optional(Type.String()),
     autoArchiveMin: Type.Optional(Type.Number()),
+    appliedTags: Type.Optional(Type.Array(Type.String())),
   };
 }
 
@@ -257,13 +507,20 @@ function buildChannelManagementSchema() {
   };
 }
 
-function buildMessageToolSchemaProps(options: { includeButtons: boolean; includeCards: boolean }) {
+function buildMessageToolSchemaProps(options: {
+  includeInteractive: boolean;
+  includeButtons: boolean;
+  includeCards: boolean;
+  includeComponents: boolean;
+  includeBlocks: boolean;
+  includeTelegramPollExtras: boolean;
+}) {
   return {
     ...buildRoutingSchema(),
     ...buildSendSchema(options),
     ...buildReactionSchema(),
     ...buildFetchSchema(),
-    ...buildPollSchema(),
+    ...buildPollSchema({ includeTelegramExtras: options.includeTelegramPollExtras }),
     ...buildChannelTargetSchema(),
     ...buildStickerSchema(),
     ...buildThreadSchema(),
@@ -277,7 +534,14 @@ function buildMessageToolSchemaProps(options: { includeButtons: boolean; include
 
 function buildMessageToolSchemaFromActions(
   actions: readonly string[],
-  options: { includeButtons: boolean; includeCards: boolean },
+  options: {
+    includeInteractive: boolean;
+    includeButtons: boolean;
+    includeCards: boolean;
+    includeComponents: boolean;
+    includeBlocks: boolean;
+    includeTelegramPollExtras: boolean;
+  },
 ) {
   const props = buildMessageToolSchemaProps(options);
   return Type.Object({
@@ -287,8 +551,12 @@ function buildMessageToolSchemaFromActions(
 }
 
 const MessageToolSchema = buildMessageToolSchemaFromActions(AllMessageActions, {
+  includeInteractive: true,
   includeButtons: true,
   includeCards: true,
+  includeComponents: true,
+  includeBlocks: true,
+  includeTelegramPollExtras: true,
 });
 
 type MessageToolOptions = {
@@ -298,19 +566,130 @@ type MessageToolOptions = {
   currentChannelId?: string;
   currentChannelProvider?: string;
   currentThreadTs?: string;
+  currentMessageId?: string | number;
   replyToMode?: "off" | "first" | "all";
   hasRepliedRef?: { value: boolean };
   sandboxRoot?: string;
   requireExplicitTarget?: boolean;
+  requesterSenderId?: string;
 };
 
-function buildMessageToolSchema(cfg: OpenClawConfig) {
-  const actions = listChannelMessageActions(cfg);
-  const includeButtons = supportsChannelMessageButtons(cfg);
-  const includeCards = supportsChannelMessageCards(cfg);
+function resolveMessageToolSchemaActions(params: {
+  cfg: OpenClawConfig;
+  currentChannelProvider?: string;
+  currentChannelId?: string;
+}): string[] {
+  const currentChannel = normalizeMessageChannel(params.currentChannelProvider);
+  if (currentChannel) {
+    const scopedActions = filterActionsForContext({
+      actions: listChannelSupportedActions({
+        cfg: params.cfg,
+        channel: currentChannel,
+      }),
+      channel: currentChannel,
+      currentChannelId: params.currentChannelId,
+    });
+    const allActions = new Set<string>(["send", ...scopedActions]);
+    // Include actions from other configured channels so isolated/cron agents
+    // can invoke cross-channel actions without validation errors.
+    for (const plugin of listChannelPlugins()) {
+      if (plugin.id === currentChannel) {
+        continue;
+      }
+      for (const action of listChannelSupportedActions({ cfg: params.cfg, channel: plugin.id })) {
+        allActions.add(action);
+      }
+    }
+    return Array.from(allActions);
+  }
+  const actions = listChannelMessageActions(params.cfg);
+  return actions.length > 0 ? actions : ["send"];
+}
+
+function resolveIncludeCapability(
+  params: {
+    cfg: OpenClawConfig;
+    currentChannelProvider?: string;
+  },
+  capability: ChannelMessageCapability,
+): boolean {
+  const currentChannel = normalizeMessageChannel(params.currentChannelProvider);
+  if (currentChannel) {
+    return channelSupportsMessageCapabilityForChannel(
+      {
+        cfg: params.cfg,
+        channel: currentChannel,
+      },
+      capability,
+    );
+  }
+  return channelSupportsMessageCapability(params.cfg, capability);
+}
+
+function resolveIncludeComponents(params: {
+  cfg: OpenClawConfig;
+  currentChannelProvider?: string;
+}): boolean {
+  return resolveIncludeCapability(params, "components");
+}
+
+function resolveIncludeInteractive(params: {
+  cfg: OpenClawConfig;
+  currentChannelProvider?: string;
+}): boolean {
+  return resolveIncludeCapability(params, "interactive");
+}
+
+function resolveIncludeButtons(params: {
+  cfg: OpenClawConfig;
+  currentChannelProvider?: string;
+}): boolean {
+  return resolveIncludeCapability(params, "buttons");
+}
+
+function resolveIncludeCards(params: {
+  cfg: OpenClawConfig;
+  currentChannelProvider?: string;
+}): boolean {
+  return resolveIncludeCapability(params, "cards");
+}
+
+function resolveIncludeBlocks(params: {
+  cfg: OpenClawConfig;
+  currentChannelProvider?: string;
+}): boolean {
+  return resolveIncludeCapability(params, "blocks");
+}
+
+function resolveIncludeTelegramPollExtras(params: {
+  cfg: OpenClawConfig;
+  currentChannelProvider?: string;
+}): boolean {
+  return listChannelSupportedActions({
+    cfg: params.cfg,
+    channel: "telegram",
+  }).includes("poll");
+}
+
+function buildMessageToolSchema(params: {
+  cfg: OpenClawConfig;
+  currentChannelProvider?: string;
+  currentChannelId?: string;
+}) {
+  const actions = resolveMessageToolSchemaActions(params);
+  const includeInteractive = resolveIncludeInteractive(params);
+  const includeButtons = resolveIncludeButtons(params);
+  const includeCards = resolveIncludeCards(params);
+  const includeComponents = resolveIncludeComponents(params);
+  const includeBlocks = resolveIncludeBlocks(params);
+  const includeTelegramPollExtras = resolveIncludeTelegramPollExtras(params);
   return buildMessageToolSchemaFromActions(actions.length > 0 ? actions : ["send"], {
+    includeInteractive,
     includeButtons,
     includeCards,
+    includeComponents,
+    includeBlocks,
+    includeTelegramPollExtras,
   });
 }
 
@@ -356,7 +735,7 @@ function buildMessageToolDescription(options?: {
 }): string {
   const baseDescription = "Send, delete, and manage messages via channel plugins.";
 
-  // If we have a current channel, show only its supported actions
+  // If we have a current channel, show its actions and list other configured channels
   if (options?.currentChannel) {
     const channelActions = filterActionsForContext({
       actions: listChannelSupportedActions({
@@ -370,7 +749,25 @@ function buildMessageToolDescription(options?: {
       // Always include "send" as a base action
       const allActions = new Set(["send", ...channelActions]);
       const actionList = Array.from(allActions).toSorted().join(", ");
-      return `${baseDescription} Current channel (${options.currentChannel}) supports: ${actionList}.`;
+      let desc = `${baseDescription} Current channel (${options.currentChannel}) supports: ${actionList}.`;
+
+      // Include other configured channels so cron/isolated agents can discover them
+      const otherChannels: string[] = [];
+      for (const plugin of listChannelPlugins()) {
+        if (plugin.id === options.currentChannel) {
+          continue;
+        }
+        const actions = listChannelSupportedActions({ cfg: options.config, channel: plugin.id });
+        if (actions.length > 0) {
+          const all = new Set(["send", ...actions]);
+          otherChannels.push(`${plugin.id} (${Array.from(all).toSorted().join(", ")})`);
+        }
+      }
+      if (otherChannels.length > 0) {
+        desc += ` Other configured channels: ${otherChannels.join(", ")}.`;
+      }
+
+      return desc;
     }
   }
 
@@ -387,7 +784,13 @@ function buildMessageToolDescription(options?: {
 
 export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
   const agentAccountId = resolveAgentAccountId(options?.agentAccountId);
-  const schema = options?.config ? buildMessageToolSchema(options.config) : MessageToolSchema;
+  const schema = options?.config
+    ? buildMessageToolSchema({
+        cfg: options.config,
+        currentChannelProvider: options.currentChannelProvider,
+        currentChannelId: options.currentChannelId,
+      })
+    : MessageToolSchema;
   const description = buildMessageToolDescription({
     config: options?.config,
     currentChannel: options?.currentChannelProvider,
@@ -417,7 +820,16 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
         }
       }
 
-      const cfg = options?.config ?? loadConfig();
+      const cfg = options?.config
+        ? options.config
+        : (
+            await resolveCommandSecretRefsViaGateway({
+              config: loadConfig(),
+              commandName: "tools.message",
+              targetIds: getChannelsCommandSecretTargetIds(),
+              mode: "enforce_resolved",
+            })
+          ).resolvedConfig;
       const action = readStringParam(params, "action", {
         required: true,
       }) as ChannelMessageActionName;
@@ -441,25 +853,36 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
         params.accountId = accountId;
       }
 
-      const gateway = {
-        url: readStringParam(params, "gatewayUrl", { trim: false }),
-        token: readStringParam(params, "gatewayToken", { trim: false }),
+      const gatewayResolved = resolveGatewayOptions({
+        gatewayUrl: readStringParam(params, "gatewayUrl", { trim: false }),
+        gatewayToken: readStringParam(params, "gatewayToken", { trim: false }),
         timeoutMs: readNumberParam(params, "timeoutMs"),
+      });
+      const gateway = {
+        url: gatewayResolved.url,
+        token: gatewayResolved.token,
+        timeoutMs: gatewayResolved.timeoutMs,
         clientName: GATEWAY_CLIENT_IDS.GATEWAY_CLIENT,
         clientDisplayName: "agent",
         mode: GATEWAY_CLIENT_MODES.BACKEND,
       };
+      const hasCurrentMessageId =
+        typeof options?.currentMessageId === "number" ||
+        (typeof options?.currentMessageId === "string" &&
+          options.currentMessageId.trim().length > 0);
 
       const toolContext =
         options?.currentChannelId ||
         options?.currentChannelProvider ||
         options?.currentThreadTs ||
+        hasCurrentMessageId ||
         options?.replyToMode ||
         options?.hasRepliedRef
           ? {
               currentChannelId: options?.currentChannelId,
               currentChannelProvider: options?.currentChannelProvider,
               currentThreadTs: options?.currentThreadTs,
+              currentMessageId: options?.currentMessageId,
               replyToMode: options?.replyToMode,
               hasRepliedRef: options?.hasRepliedRef,
               // Direct tool invocations should not add cross-context decoration.
@@ -473,8 +896,10 @@ export function createMessageTool(options?: MessageToolOptions): AnyAgentTool {
         action,
         params,
         defaultAccountId: accountId ?? undefined,
+        requesterSenderId: options?.requesterSenderId,
         gateway,
         toolContext,
+        sessionKey: options?.agentSessionKey,
         agentId: options?.agentSessionKey
           ? resolveSessionAgentId({ sessionKey: options.agentSessionKey, config: cfg })
           : undefined,
